@@ -8,9 +8,11 @@
 
 测试所用Suo5客户端版本: v2.0.0
 
-## 示例
+## Example
 
-### 直接运行
+### Normal
+
+直接运行
 
 ![img.png](img/normal.png)
 
@@ -44,3 +46,9 @@ Content-Disposition: form-data; name="2"
 ```
 
 ![img_1.png](img/nextjs-react.png)
+
+### Native JavaScript code
+
+原生js代码执行
+
+![img.png](img/native.png)
