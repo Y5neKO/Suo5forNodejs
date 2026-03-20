@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const net = require('net');
 const os = require('os');
 
@@ -57,10 +58,12 @@ async function processRequest(req, res) {
             break;
         case 0x02: // Half Stream
             setBypassHeader(res);
-            // 穿透模板引擎 (Node中不直接 break，接着走到 0x03 共享主体逻辑，但根据 mode 做区分)
+        // 穿透模板引擎 (Node中不直接 break，接着走到 0x03 共享主体逻辑，但根据 mode 做区分)
         case 0x03: // Classic
-            await handleRedirect(req, res, dataMap); // 若是重定向直接在此拦截
-            
+            // 拦截重定向 SSRF 请求
+            let isRedirected = await handleRedirect(req, res, dataMap, reader);
+            if (isRedirected) return;
+
             if (!sid || !ctx.has(sid)) {
                 res.writeHead(403);
                 res.end();
@@ -130,6 +133,9 @@ async function processHandshake(req, res, dataMap, tunId, sid) {
             start: parts[0] || "",
             end: parts[1] || ""
         });
+    } else {
+        // 不使用模板时也要存入空 ctx，防止后续请求 403
+        ctx.set(sid, { ct: "", start: "", end: "" });
     }
 
     let jkData = dataMap.get("jk");
@@ -145,9 +151,9 @@ async function processHandshake(req, res, dataMap, tunId, sid) {
         setBypassHeader(res);
         await writeAndFlush(res, processTemplateStart(res, sid), 0);
         await writeAndFlush(res, marshalBase64(newData(tunId, dataMap.get("dt"))), 0);
-        
+
         await new Promise(r => setTimeout(r, 2000));
-        
+
         await writeAndFlush(res, marshalBase64(newData(tunId, Buffer.from(sid))), 0);
         await writeAndFlush(res, processTemplateEnd(sid), 0);
         res.end();
@@ -157,7 +163,7 @@ async function processHandshake(req, res, dataMap, tunId, sid) {
         let b3 = marshalBase64(newData(tunId, Buffer.from(sid)));
         let b4 = processTemplateEnd(sid);
         let body = Buffer.concat([b1, b2, b3, b4]);
-        
+
         res.setHeader('Content-Length', body.length);
         await writeAndFlush(res, body, 0);
         res.end();
@@ -198,7 +204,7 @@ async function processFullStream(reader, res, dataMap, tunId) {
             try {
                 nMap = await unmarshalBase64(reader);
             } catch (e) { break; }
-            
+
             if (!nMap || nMap.size === 0) break;
             let action = nMap.get("ac")[0];
             if (action === 0x01) {
@@ -228,12 +234,13 @@ async function processHalfStream(dataMap, res, tunId, dirtySize) {
     try {
         switch (action) {
             case 0x00:
-                let createData = await performCreate(dataMap, tunId);
+                // 半双工模式传 true
+                let createData = await performCreate(dataMap, tunId, true);
                 await writeAndFlush(res, createData, dirtySize);
-                
+
                 let tunObj = ctx.get(tunId);
                 if (!tunObj) throw new Error("not found");
-                
+
                 // Block and stream indefinitely
                 await new Promise(resolve => {
                     tunObj.socket.on('data', async (chunk) => {
@@ -264,7 +271,8 @@ async function processClassic(req, dataMap, tunId) {
     try {
         switch (action) {
             case 0x00:
-                return await performCreate(dataMap, tunId);
+                // Classic 模式传 false
+                return await performCreate(dataMap, tunId, false);
             case 0x01:
                 performWrite(dataMap, tunId);
                 return performRead(tunId);
@@ -280,17 +288,20 @@ async function processClassic(req, dataMap, tunId) {
 }
 
 
-// -- Socket 基础操作 (取代了原来的多线程模型) --
+// -- Socket 基础操作 --
 
-async function performCreate(dataMap, tunId) {
+// 增加 isHalfStream 参数，防止半双工模式下内存溢出 OOM
+async function performCreate(dataMap, tunId, isHalfStream = false) {
     let host = dataMap.get("h").toString();
     let port = parseInt(dataMap.get("p").toString(), 10);
-    
+
     let socket = new net.Socket();
     let tunObj = { socket: socket, readQueue: [], isOpen: false };
 
     return new Promise((resolve) => {
-        socket.on('data', chunk => tunObj.readQueue.push(chunk));
+        if (!isHalfStream) {
+            socket.on('data', chunk => tunObj.readQueue.push(chunk));
+        }
         socket.on('close', () => tunObj.isOpen = false);
         socket.on('error', () => tunObj.isOpen = false);
 
@@ -301,7 +312,7 @@ async function performCreate(dataMap, tunId) {
             ctx.set(tunId, tunObj);
             resolve(marshalBase64(newStatus(tunId, 0x00)));
         });
-        
+
         socket.once('error', () => resolve(marshalBase64(newStatus(tunId, 0x01))));
         socket.once('timeout', () => { socket.destroy(); resolve(marshalBase64(newStatus(tunId, 0x01))); });
     });
@@ -319,23 +330,23 @@ function performWrite(dataMap, tunId) {
 function performRead(tunId) {
     let tunObj = ctx.get(tunId);
     if (!tunObj) throw new Error("tunnel not found");
-    
+
     let maxSize = 512 * 1024;
     let written = 0;
     let bufs = [];
-    
+
     while (tunObj.readQueue.length > 0) {
         let chunk = tunObj.readQueue.shift();
         written += chunk.length;
         bufs.push(marshalBase64(newData(tunId, chunk)));
         if (written >= maxSize) break;
     }
-    
+
     if (!tunObj.isOpen && tunObj.readQueue.length === 0) {
         performDelete(tunId);
         bufs.push(marshalBase64(newDel(tunId)));
     }
-    
+
     return Buffer.concat(bufs);
 }
 
@@ -356,18 +367,18 @@ async function unmarshalBase64(reader) {
         let headerBase64 = await reader.read(8);
         if (headerBase64.length === 0) return m;
         let header = b64urlDecode(headerBase64.toString());
-        
+
         let xor = Buffer.from([header[0], header[1]]);
         for (let i = 2; i < 6; i++) {
             header[i] ^= xor[i % 2];
         }
-        
+
         let len = header.readUInt32BE(2);
         if (len > 1024 * 1024 * 32 || len < 0) throw new Error("invalid len");
 
         let bsBase64 = await reader.read(len);
         let bs = b64urlDecode(bsBase64.toString());
-        
+
         for (let i = 0; i < bs.length; i++) {
             bs[i] ^= xor[i % 2];
         }
@@ -377,13 +388,13 @@ async function unmarshalBase64(reader) {
             let kLen = bs[offset++];
             let key = bs.subarray(offset, offset + kLen).toString('utf8');
             offset += kLen;
-            
+
             let vLen = bs.readUInt32BE(offset);
             offset += 4;
-            
+
             let value = bs.subarray(offset, offset + vLen);
             offset += vLen;
-            
+
             m.set(key, value);
         }
     } catch (e) { /* ignore to return partial map */ }
@@ -410,7 +421,7 @@ function marshalBase64(m) {
 
     let buf = Buffer.concat(buffers);
     let keyXor = Buffer.from([Math.floor(Math.random()*255)+1, Math.floor(Math.random()*255)+1]);
-    
+
     for (let i = 0; i < buf.length; i++) {
         buf[i] ^= keyXor[i % 2];
     }
@@ -429,7 +440,6 @@ function marshalBase64(m) {
 
 // -- 工具/流方法 --
 
-// HTTP 流读取封装，使 Stream 可以同步 await 提取定长数据
 class StreamReader {
     constructor(stream) {
         this.stream = stream;
@@ -484,24 +494,80 @@ async function writeAndFlush(res, data, dirtySize) {
     }
 }
 
-async function handleRedirect(req, res, dataMap) {
+async function handleRedirect(req, res, dataMap, reader) {
     let redirectData = dataMap.get("r");
+
     if (redirectData && redirectData.length > 0 && !isLocalAddr(redirectData.toString())) {
-        // 因原版在Node实现透传比较冗余且不常被作为 LoadBalancer，此处简化省略完整转发
+        let targetUrlStr = redirectData.toString();
+
+        dataMap.delete("r");
+
+        let headerData = marshalBase64(dataMap);
+
+        let bodyContent = await new Promise((resolve) => {
+            if (reader.ended) {
+                resolve(reader.buffer);
+            } else {
+                reader.stream.on('end', () => resolve(reader.buffer));
+            }
+        });
+
+        let newBody = Buffer.concat([headerData, bodyContent]);
+
+        let targetUrl;
+        try {
+            targetUrl = new URL(targetUrlStr);
+        } catch (e) {
+            return false;
+        }
+
+        const clientModule = targetUrl.protocol === 'https:' ? https : http;
+
+        const options = {
+            method: req.method,
+            headers: Object.assign({}, req.headers),
+            timeout: 3000,
+            rejectUnauthorized: false
+        };
+
+        options.headers['content-length'] = newBody.length;
+        options.headers['host'] = targetUrl.host;
+        options.headers['connection'] = 'close';
+        delete options.headers['content-encoding'];
+        delete options.headers['transfer-encoding'];
+
+        return new Promise((resolve) => {
+            let proxyReq = clientModule.request(targetUrl, options, (proxyRes) => {
+                res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                proxyRes.pipe(res);
+                proxyRes.on('end', () => resolve(true));
+            });
+
+            proxyReq.on('error', (err) => {
+                if (!res.headersSent) res.writeHead(500);
+                res.end();
+                resolve(true);
+            });
+
+            proxyReq.write(newBody);
+            proxyReq.end();
+        });
     }
+    return false;
 }
 
+// 模板 Header 安全处理
 function processTemplateStart(res, sid) {
     let tpl = ctx.get(sid);
     if (!tpl) return Buffer.alloc(0);
-    res.setHeader("Content-Type", tpl.ct);
-    return Buffer.from(tpl.start);
+    if (tpl.ct) res.setHeader("Content-Type", tpl.ct);
+    return Buffer.from(tpl.start || "");
 }
 
 function processTemplateEnd(sid) {
     let tpl = ctx.get(sid);
     if (!tpl) return Buffer.alloc(0);
-    return Buffer.from(tpl.end);
+    return Buffer.from(tpl.end || "");
 }
 
 function setBypassHeader(res) {
@@ -588,7 +654,6 @@ function isLocalAddr(urlStr) {
     } catch (e) { return false; }
 }
 
-// 监听特定端口（模拟 Servlet 环境）
 server.listen(8080, () => {
     console.log("Node.js Suo5 Tunneling Server running on port 8080");
 });
